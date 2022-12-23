@@ -1,0 +1,593 @@
+diff -Naur zfs-linux-0.7.12_base/cmd/mount_zfs/mount_zfs.c zfs-linux-0.7.12_v01/cmd/mount_zfs/mount_zfs.c
+--- zfs-linux-0.7.12_base/cmd/mount_zfs/mount_zfs.c	2018-11-08 14:40:44.000000000 -0800
++++ zfs-linux-0.7.12_v01/cmd/mount_zfs/mount_zfs.c	2019-05-20 06:37:29.749943776 -0700
+@@ -500,6 +500,15 @@
+ 		return (MOUNT_USAGE);
+ 	}
+ 
++	/* check that the dataset is consistent */
++	if (zfs_prop_get_int(zhp, ZFS_PROP_INCONSISTENT) != 0) {
++		zfs_close(zhp);
++		libzfs_fini(g_zfs);
++		fprintf(stderr, gettext("filesystem '%s' is inconsistent, "
++					"and cannot be mounted\n"), dataset);
++		return (MOUNT_SYSERR);
++	}
++	
+ 	/*
+ 	 * Checks to see if the ZFS_PROP_SELINUX_CONTEXT exists
+ 	 * if it does, create a tmp variable in case it's needed
+diff -Naur zfs-linux-0.7.12_base/cmd/zpool/zpool_main.c zfs-linux-0.7.12_v01/cmd/zpool/zpool_main.c
+--- zfs-linux-0.7.12_base/cmd/zpool/zpool_main.c	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/cmd/zpool/zpool_main.c	2019-05-20 07:11:04.002095235 -0700
+@@ -312,13 +312,13 @@
+ 		return (gettext("\thistory [-il] [<pool>] ...\n"));
+ 	case HELP_IMPORT:
+ 		return (gettext("\timport [-d dir] [-D]\n"
+-		    "\timport [-d dir | -c cachefile] [-F [-n]] <pool | id>\n"
++		    "\timport [-d dir | -c cachefile] [-F [-n]] [-L] <pool | id>\n"
+ 		    "\timport [-o mntopts] [-o property=value] ... \n"
+ 		    "\t    [-d dir | -c cachefile] [-D] [-f] [-m] [-N] "
+-		    "[-R root] [-F [-n]] -a\n"
++		    "[-R root] [-F [-n]] [-L] -a\n"
+ 		    "\timport [-o mntopts] [-o property=value] ... \n"
+ 		    "\t    [-d dir | -c cachefile] [-D] [-f] [-m] [-N] "
+-		    "[-R root] [-F [-n]]\n"
++		    "[-R root] [-F [-n]] [-L]\n"
+ 		    "\t    <pool | id> [newpool]\n"));
+ 	case HELP_IOSTAT:
+ 		return (gettext("\tiostat [[[-c [script1,script2,...]"
+@@ -2397,6 +2397,11 @@
+  *
+  *       -o	Set property=value and/or temporary mount options (without '=').
+  *
++ *
++ *       -L     Import a pool without checking the inconsistency flag 
++ *              of each dataset, and without visiting children of datasets 
++ *              whose "blocked" is "on", thus speeding up the process
++ *
+  *	 -s	Scan using the default search path, the libblkid cache will
+  *	        not be consulted.
+  *
+@@ -2436,7 +2441,7 @@
+ 	char *endptr;
+ 
+ 	/* check options */
+-	while ((c = getopt(argc, argv, ":aCc:d:DEfFmnNo:R:stT:VX")) != -1) {
++	while ((c = getopt(argc, argv, ":aCc:d:DEfFmnNo:R:stT:VXL")) != -1) {
+ 		switch (c) {
+ 		case 'a':
+ 			do_all = B_TRUE;
+@@ -2525,6 +2530,9 @@
+ 			    "'%c' option\n"), optopt);
+ 			usage(B_FALSE);
+ 			break;
++		case 'L':
++			flags |= ZFS_IMPORT_LAZY;
++			break;
+ 		case '?':
+ 			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
+ 			    optopt);
+diff -Naur zfs-linux-0.7.12_base/include/libzfs.h zfs-linux-0.7.12_v01/include/libzfs.h
+--- zfs-linux-0.7.12_base/include/libzfs.h	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/include/libzfs.h	2019-05-20 07:16:57.950999124 -0700
+@@ -149,6 +149,7 @@
+ 	EZFS_POOLREADONLY,	/* pool is in read-only mode */
+ 	EZFS_SCRUB_PAUSED,	/* scrub currently paused */
+ 	EZFS_ACTIVE_POOL,	/* pool is imported on a different system */
++	EZFS_BLOCKED,		/* cannot descend past blocked dataset */
+ 	EZFS_UNKNOWN
+ } zfs_error_t;
+ 
+diff -Naur zfs-linux-0.7.12_base/include/sys/dmu.h zfs-linux-0.7.12_v01/include/sys/dmu.h
+--- zfs-linux-0.7.12_base/include/sys/dmu.h	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/include/sys/dmu.h	2019-05-20 07:18:49.400764734 -0700
+@@ -248,6 +248,7 @@
+ #define	DS_FIND_SNAPSHOTS	(1<<0)
+ #define	DS_FIND_CHILDREN	(1<<1)
+ #define	DS_FIND_SERIALIZE	(1<<2)
++#define	DS_FIND_RESPECT_BLOCKED	(1<<3)
+ 
+ /*
+  * The maximum number of bytes that can be accessed as part of one
+diff -Naur zfs-linux-0.7.12_base/include/sys/dsl_dir.h zfs-linux-0.7.12_v01/include/sys/dsl_dir.h
+--- zfs-linux-0.7.12_base/include/sys/dsl_dir.h	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/include/sys/dsl_dir.h	2019-05-20 07:25:08.032038271 -0700
+@@ -81,7 +81,8 @@
+ 	uint64_t dd_flags;
+ 	uint64_t dd_used_breakdown[DD_USED_NUM];
+ 	uint64_t dd_clones; /* dsl_dir objects */
+-	uint64_t dd_pad[13]; /* pad out to 256 bytes for good measure */
++	uint64_t dd_blocked; /* blocks descents when nonzero */
++	uint64_t dd_pad[12]; /* pad out to 256 bytes for good measure */
+ } dsl_dir_phys_t;
+ 
+ struct dsl_dir {
+@@ -164,6 +165,7 @@
+     dmu_tx_t *tx);
+ void dsl_dir_zapify(dsl_dir_t *dd, dmu_tx_t *tx);
+ boolean_t dsl_dir_is_zapified(dsl_dir_t *dd);
++int dsl_dir_set_blocked(const char *ddname, uint64_t value);
+ 
+ /* internal reserved dir name */
+ #define	MOS_DIR_NAME "$MOS"
+diff -Naur zfs-linux-0.7.12_base/include/sys/fs/zfs.h zfs-linux-0.7.12_v01/include/sys/fs/zfs.h
+--- zfs-linux-0.7.12_base/include/sys/fs/zfs.h	2018-11-08 14:40:44.000000000 -0800
++++ zfs-linux-0.7.12_v01/include/sys/fs/zfs.h	2019-05-20 07:34:38.068609944 -0700
+@@ -171,6 +171,7 @@
+ 	ZFS_PROP_OVERLAY,
+ 	ZFS_PROP_PREV_SNAP,
+ 	ZFS_PROP_RECEIVE_RESUME_TOKEN,
++	ZFS_PROP_BLOCKED,
+ 	ZFS_NUM_PROPS
+ } zfs_prop_t;
+ 
+@@ -1145,6 +1146,7 @@
+ #define	ZFS_IMPORT_ONLY		0x8
+ #define	ZFS_IMPORT_TEMP_NAME	0x10
+ #define	ZFS_IMPORT_SKIP_MMP	0x20
++#define	ZFS_IMPORT_LAZY		0x80 // leave enough room
+ 
+ /*
+  * Sysevent payload members.  ZFS will generate the following sysevents with the
+diff -Naur zfs-linux-0.7.12_base/include/sys/spa.h zfs-linux-0.7.12_v01/include/sys/spa.h
+--- zfs-linux-0.7.12_base/include/sys/spa.h	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/include/sys/spa.h	2019-05-20 07:36:22.742511401 -0700
+@@ -838,6 +838,7 @@
+ extern uint64_t spa_delegation(spa_t *spa);
+ extern objset_t *spa_meta_objset(spa_t *spa);
+ extern uint64_t spa_deadman_synctime(spa_t *spa);
++extern uint64_t spa_imported_lazy(spa_t *spa);
+ 
+ /* Miscellaneous support routines */
+ extern void spa_activate_mos_feature(spa_t *spa, const char *feature,
+diff -Naur zfs-linux-0.7.12_base/include/sys/zil.h zfs-linux-0.7.12_v01/include/sys/zil.h
+--- zfs-linux-0.7.12_base/include/sys/zil.h	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/include/sys/zil.h	2019-05-20 07:39:08.475188724 -0700
+@@ -63,7 +63,8 @@
+ 	uint64_t zh_claim_blk_seq; /* highest claimed block sequence number */
+ 	uint64_t zh_flags;	/* header flags */
+ 	uint64_t zh_claim_lr_seq; /* highest claimed lr sequence number */
+-	uint64_t zh_pad[3];
++	uint64_t zh_sync_txg;	/* txg of last zil_sync */
++	uint64_t zh_pad[2];
+ } zil_header_t;
+ 
+ /*
+diff -Naur zfs-linux-0.7.12_base/lib/libzfs/libzfs_iter.c zfs-linux-0.7.12_v01/lib/libzfs/libzfs_iter.c
+--- zfs-linux-0.7.12_base/lib/libzfs/libzfs_iter.c	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/lib/libzfs/libzfs_iter.c	2019-05-20 07:50:23.560355315 -0700
+@@ -82,9 +82,14 @@
+ 		 * An errno value of ESRCH indicates normal completion.
+ 		 * If ENOENT is returned, then the underlying dataset
+ 		 * has been removed since we obtained the handle.
++		 *
++		 * ENOMEDIUM means dmu_dir_list_next cannot descend down
++		 * a blocked dataset, and should be treated by
++		 * zfs_iter_filesystems just as in the previous cases.
+ 		 */
+ 		case ESRCH:
+ 		case ENOENT:
++		case ENOMEDIUM:
+ 			rc = 1;
+ 			break;
+ 		default:
+diff -Naur zfs-linux-0.7.12_base/lib/libzfs/libzfs_mount.c zfs-linux-0.7.12_v01/lib/libzfs/libzfs_mount.c
+--- zfs-linux-0.7.12_base/lib/libzfs/libzfs_mount.c	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/lib/libzfs/libzfs_mount.c	2019-05-20 08:22:18.832533437 -0700
+@@ -1150,7 +1150,10 @@
+ 
+ 	libzfs_add_handle(cbp, zhp);
+ 	if (zfs_iter_filesystems(zhp, mount_cb, cbp) != 0) {
+-		zfs_close(zhp);
++		/* Redundant (zpool_enable_datasets closes all at out: ): */
++		/* zfs_close(zhp); */
++		/* the reason this never crashes anything is because mount_cb
++		 * currently never returns nonzero */
+ 		return (-1);
+ 	}
+ 	return (0);
+diff -Naur zfs-linux-0.7.12_base/lib/libzfs/libzfs_util.c zfs-linux-0.7.12_v01/lib/libzfs/libzfs_util.c
+--- zfs-linux-0.7.12_base/lib/libzfs/libzfs_util.c	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/lib/libzfs/libzfs_util.c	2019-05-20 08:31:00.255463086 -0700
+@@ -266,6 +266,8 @@
+ 	case EZFS_ACTIVE_POOL:
+ 		return (dgettext(TEXT_DOMAIN, "pool is imported on a "
+ 		    "different host"));
++	case EZFS_BLOCKED:
++		return (dgettext(TEXT_DOMAIN, "blocked dataset"));
+ 	case EZFS_UNKNOWN:
+ 		return (dgettext(TEXT_DOMAIN, "unknown error"));
+ 	default:
+@@ -361,6 +363,10 @@
+ 	case EINTR:
+ 		zfs_verror(hdl, EZFS_INTR, fmt, ap);
+ 		return (-1);
++
++	case ENOMEDIUM:
++		zfs_verror(hdl, EZFS_BLOCKED, fmt, ap);
++		return (-1);
+ 	}
+ 
+ 	return (0);
+diff -Naur zfs-linux-0.7.12_base/man/man8/zfs.8 zfs-linux-0.7.12_v01/man/man8/zfs.8
+--- zfs-linux-0.7.12_base/man/man8/zfs.8	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/man/man8/zfs.8	2019-05-20 08:57:44.774172147 -0700
+@@ -530,6 +530,17 @@
+ .Pp
+ This property can also be referred to by its shortened column name,
+ .Sy avail .
++.It Sy blocked
++When the pool has been imported lazy, if
++.Sy blocked
++is
++.Sy on
++for a dataset, then the children of this dataset won't get visited in recursive listing operations like
++.Sy zfs list
++or
++.Sy zfs get
++(but recursive snapshot still works as usual). The default value is
++.Sy off .
+ .It Sy compressratio
+ For non-snapshots, the compression ratio achieved for the
+ .Sy used
+diff -Naur zfs-linux-0.7.12_base/man/man8/zpool.8 zfs-linux-0.7.12_v01/man/man8/zpool.8
+--- zfs-linux-0.7.12_base/man/man8/zpool.8	2018-11-08 14:40:43.000000000 -0800
++++ zfs-linux-0.7.12_v01/man/man8/zpool.8	2019-05-20 09:14:51.526941275 -0700
+@@ -92,7 +92,7 @@
+ .Nm
+ .Cm import
+ .Fl a
+-.Op Fl DfmN
++.Op Fl DfLmN
+ .Op Fl F Oo Fl n Oc Oo Fl T Oc Oo Fl X Oc
+ .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
+ .Op Fl o Ar mntopts
+@@ -100,7 +100,7 @@
+ .Op Fl R Ar root
+ .Nm
+ .Cm import
+-.Op Fl Dfm
++.Op Fl DfLm
+ .Op Fl F Oo Fl n Oc Oo Fl T Oc Oo Fl X Oc
+ .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
+ .Op Fl o Ar mntopts
+@@ -1186,7 +1186,7 @@
+ .Nm
+ .Cm import
+ .Fl a
+-.Op Fl DfmN
++.Op Fl DfLmN
+ .Op Fl F Oo Fl n Oc Oo Fl T Oc Oo Fl X Oc
+ .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
+ .Op Fl o Ar mntopts
+@@ -1237,6 +1237,12 @@
+ Not all damaged pools can be recovered by using this option.
+ If successful, the data from the discarded transactions is irretrievably lost.
+ This option is ignored if the pool is importable or already imported.
++.It Fl L
++Import a pool without checking the inconsistency flag of each dataset, and without visiting children of datasets whose
++.Sy blocked
++is
++.Sy on
++, thus speeding up the process.
+ .It Fl m
+ Allows a pool to import when there is a missing log device.
+ Recent transactions can be lost because the log device will be discarded.
+@@ -1298,7 +1304,7 @@
+ .It Xo
+ .Nm
+ .Cm import
+-.Op Fl Dfm
++.Op Fl DfLm
+ .Op Fl F Oo Fl n Oc Oo Fl t Oc Oo Fl T Oc Oo Fl X Oc
+ .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir
+ .Op Fl o Ar mntopts
+@@ -1357,6 +1363,12 @@
+ Not all damaged pools can be recovered by using this option.
+ If successful, the data from the discarded transactions is irretrievably lost.
+ This option is ignored if the pool is importable or already imported.
++.It Fl L
++Import a pool without checking the inconsistency flag of each dataset, and without visiting children of datasets whose
++.Sy blocked
++is
++.Sy on
++, thus speeding up the process.
+ .It Fl m
+ Allows a pool to import when there is a missing log device.
+ Recent transactions can be lost because the log device will be discarded.
+diff -Naur zfs-linux-0.7.12_base/module/zcommon/zfs_prop.c zfs-linux-0.7.12_v01/module/zcommon/zfs_prop.c
+--- zfs-linux-0.7.12_base/module/zcommon/zfs_prop.c	2018-11-08 17:11:23.000000000 -0800
++++ zfs-linux-0.7.12_v01/module/zcommon/zfs_prop.c	2019-05-20 09:19:12.125716684 -0700
+@@ -373,6 +373,10 @@
+ 	    ZFS_TYPE_FILESYSTEM | ZFS_TYPE_SNAPSHOT,
+ 	    "on | off", "UTF8ONLY", boolean_table);
+ 
++	/* special index properties */
++	zprop_register_index(ZFS_PROP_BLOCKED, "blocked", 0, PROP_DEFAULT,
++	    ZFS_TYPE_FILESYSTEM, "on | off", "BLOCKED", boolean_table);
++
+ 	/* string properties */
+ 	zprop_register_string(ZFS_PROP_ORIGIN, "origin", NULL, PROP_READONLY,
+ 	    ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME, "<snapshot>", "ORIGIN");
+diff -Naur zfs-linux-0.7.12_base/module/zfs/dmu_objset.c zfs-linux-0.7.12_v01/module/zfs/dmu_objset.c
+--- zfs-linux-0.7.12_base/module/zfs/dmu_objset.c	2018-11-08 17:11:23.000000000 -0800
++++ zfs-linux-0.7.12_v01/module/zfs/dmu_objset.c	2019-05-20 09:29:01.146741906 -0700
+@@ -2053,6 +2053,14 @@
+ 	zap_cursor_t cursor;
+ 	zap_attribute_t attr;
+ 
++	/* read concurrent with txg_sync_thread: guard with dd_lock */
++	mutex_enter(&dd->dd_lock);
++	if (dsl_dir_phys(dd)->dd_blocked) {
++		mutex_exit(&dd->dd_lock);
++		return (SET_ERROR(ENOMEDIUM));
++	}
++	mutex_exit(&dd->dd_lock);
++	
+ 	/* there is no next dir on a snapshot! */
+ 	if (os->os_dsl_dataset->ds_object !=
+ 	    dsl_dir_phys(dd)->dd_head_dataset_obj)
+@@ -2128,6 +2136,17 @@
+ 	thisobj = dsl_dir_phys(dd)->dd_head_dataset_obj;
+ 	attr = kmem_alloc(sizeof (zap_attribute_t), KM_SLEEP);
+ 
++	if (dcp->dc_flags & DS_FIND_RESPECT_BLOCKED) {
++		/*
++		 * guard with dd_lock since in the future
++		 * this might be run concurrent with txg_sync_thread
++		 */
++		mutex_enter(&dd->dd_lock);
++		if (dsl_dir_phys(dd)->dd_blocked)
++			dcp->dc_flags &= ~DS_FIND_CHILDREN;
++		mutex_exit(&dd->dd_lock);
++	}
++
+ 	/*
+ 	 * Iterate over all children.
+ 	 */
+diff -Naur zfs-linux-0.7.12_base/module/zfs/dsl_dir.c zfs-linux-0.7.12_v01/module/zfs/dsl_dir.c
+--- zfs-linux-0.7.12_base/module/zfs/dsl_dir.c	2018-11-08 17:11:23.000000000 -0800
++++ zfs-linux-0.7.12_v01/module/zfs/dsl_dir.c	2019-05-20 09:54:00.727751010 -0700
+@@ -959,6 +959,8 @@
+ 		    dsl_dir_phys(dd)->dd_used_breakdown[DD_USED_CHILD] +
+ 		    dsl_dir_phys(dd)->dd_used_breakdown[DD_USED_CHILD_RSRV]);
+ 	}
++	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_BLOCKED,
++	    dsl_dir_phys(dd)->dd_blocked ? 1 : 0);
+ 	mutex_exit(&dd->dd_lock);
+ 
+ 	if (dsl_dir_is_zapified(dd)) {
+@@ -2014,7 +2016,57 @@
+ 	return (doi.doi_type == DMU_OTN_ZAP_METADATA);
+ }
+ 
++typedef struct set_blocked_arg {
++	const char *sba_name;
++	uint64_t sba_value;
++} set_blocked_arg_t;
++
++static int
++dsl_dir_set_blocked_check(void *arg, dmu_tx_t *tx)
++{
++	set_blocked_arg_t *psba = arg;
++	dsl_pool_t *dp = dmu_tx_pool(tx);
++	dsl_dataset_t *ds;
++	int error = dsl_dataset_hold(dp, psba->sba_name, FTAG, &ds);
++	if (error)
++		return (error);
++	dsl_dataset_rele(ds, FTAG);
++	return (0);
++}
++
++static void
++dsl_dir_set_blocked_sync(void *arg, dmu_tx_t *tx)
++{
++	set_blocked_arg_t *psba = arg;
++	dsl_pool_t *dp = dmu_tx_pool(tx);
++	dsl_dataset_t *ds;
++
++	VERIFY0(dsl_dataset_hold(dp, psba->sba_name, FTAG, &ds));
++
++	dmu_buf_will_dirty(ds->ds_dir->dd_dbuf, tx);
++	/* write in txg_sync_thread: guard with dd_lock */
++	mutex_enter(&ds->ds_dir->dd_lock);
++	dsl_dir_phys(ds->ds_dir)->dd_blocked = psba->sba_value ?
++			dmu_tx_get_txg(tx) :
++			0;
++	mutex_exit(&ds->ds_dir->dd_lock);
++	dsl_dataset_rele(ds, FTAG);
++}
++
++int
++dsl_dir_set_blocked(const char *ddname, uint64_t value)
++{
++	set_blocked_arg_t sba;
++
++	sba.sba_name = ddname;
++	sba.sba_value = value;
++
++	return (dsl_sync_task(ddname, dsl_dir_set_blocked_check,
++	    dsl_dir_set_blocked_sync, &sba, 1, ZFS_SPACE_CHECK_RESERVED));
++}
++
+ #if defined(_KERNEL) && defined(HAVE_SPL)
+ EXPORT_SYMBOL(dsl_dir_set_quota);
+ EXPORT_SYMBOL(dsl_dir_set_reservation);
++EXPORT_SYMBOL(dsl_dir_set_blocked);
+ #endif
+diff -Naur zfs-linux-0.7.12_base/module/zfs/spa.c zfs-linux-0.7.12_v01/module/zfs/spa.c
+--- zfs-linux-0.7.12_base/module/zfs/spa.c	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/module/zfs/spa.c	2019-05-20 10:07:28.190671438 -0700
+@@ -2102,7 +2102,7 @@
+ 	rio = zio_root(spa, NULL, &sle,
+ 	    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE);
+ 
+-	if (spa_load_verify_metadata) {
++	if (spa_load_verify_metadata && !spa_imported_lazy(spa)) {
+ 		error = traverse_pool(spa, spa->spa_verify_min_txg,
+ 		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
+ 		    spa_load_verify_cb, rio);
+@@ -3225,8 +3225,11 @@
+ 		spa->spa_claiming = B_TRUE;
+ 
+ 		tx = dmu_tx_create_assigned(dp, spa_first_txg(spa));
+-		(void) dmu_objset_find_dp(dp, dp->dp_root_dir_obj,
+-		    zil_claim, tx, DS_FIND_CHILDREN);
++		(void) dmu_objset_find_dp(dp, dp->dp_root_dir_obj, zil_claim,
++		    tx,
++		    spa_imported_lazy(spa) ?
++		    		DS_FIND_CHILDREN|DS_FIND_RESPECT_BLOCKED :
++		    		DS_FIND_CHILDREN);
+ 		dmu_tx_commit(tx);
+ 
+ 		spa->spa_claiming = B_FALSE;
+@@ -3283,10 +3286,11 @@
+ 		spa_history_log_version(spa, "open", NULL);
+ 
+ 		/*
+-		 * Delete any inconsistent datasets.
++		 * Delete any inconsistent datasets (if not doing lazy import)
+ 		 */
+-		(void) dmu_objset_find(spa_name(spa),
+-		    dsl_destroy_inconsistent, NULL, DS_FIND_CHILDREN);
++		if (!spa_imported_lazy(spa))
++			(void) dmu_objset_find(spa_name(spa),
++			    dsl_destroy_inconsistent, NULL, DS_FIND_CHILDREN);
+ 
+ 		/*
+ 		 * Clean up any stale temporary dataset userrefs.
+diff -Naur zfs-linux-0.7.12_base/module/zfs/spa_misc.c zfs-linux-0.7.12_v01/module/zfs/spa_misc.c
+--- zfs-linux-0.7.12_base/module/zfs/spa_misc.c	2018-11-08 17:11:23.000000000 -0800
++++ zfs-linux-0.7.12_v01/module/zfs/spa_misc.c	2019-05-20 10:12:51.382516696 -0700
+@@ -1719,6 +1719,12 @@
+ 	return (spa->spa_log_class);
+ }
+ 
++uint64_t
++spa_imported_lazy(spa_t *spa)
++{
++	return spa->spa_import_flags & ZFS_IMPORT_LAZY;
++}
++
+ void
+ spa_evicting_os_register(spa_t *spa, objset_t *os)
+ {
+@@ -2196,6 +2202,7 @@
+ EXPORT_SYMBOL(spa_meta_objset);
+ EXPORT_SYMBOL(spa_maxblocksize);
+ EXPORT_SYMBOL(spa_maxdnodesize);
++EXPORT_SYMBOL(spa_imported_lazy);
+ 
+ /* Miscellaneous support routines */
+ EXPORT_SYMBOL(spa_rename);
+diff -Naur zfs-linux-0.7.12_base/module/zfs/zfs_ioctl.c zfs-linux-0.7.12_v01/module/zfs/zfs_ioctl.c
+--- zfs-linux-0.7.12_base/module/zfs/zfs_ioctl.c	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/module/zfs/zfs_ioctl.c	2019-05-20 10:15:45.071037226 -0700
+@@ -2470,6 +2470,9 @@
+ 		}
+ 		break;
+ 	}
++	case ZFS_PROP_BLOCKED:
++		err = dsl_dir_set_blocked(dsname, intval);
++		break;
+ 	default:
+ 		err = -1;
+ 	}
+diff -Naur zfs-linux-0.7.12_base/module/zfs/zfs_vfsops.c zfs-linux-0.7.12_v01/module/zfs/zfs_vfsops.c
+--- zfs-linux-0.7.12_base/module/zfs/zfs_vfsops.c	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/module/zfs/zfs_vfsops.c	2019-05-20 10:42:06.904168915 -0700
+@@ -1055,6 +1055,14 @@
+ 		return (error);
+ 	}
+ 
++	if (DS_IS_INCONSISTENT(dmu_objset_ds(os))) {
++		dmu_objset_disown(os, zfsvfs);
++		*zfvp = NULL;
++		kmem_free(zfsvfs, sizeof (zfsvfs_t));
++		error = SET_ERROR(ENOENT);
++		return (error);
++	}
++
+ 	zfsvfs->z_vfs = NULL;
+ 	zfsvfs->z_sb = NULL;
+ 	zfsvfs->z_parent = zfsvfs;
+diff -Naur zfs-linux-0.7.12_base/module/zfs/zil.c zfs-linux-0.7.12_v01/module/zfs/zil.c
+--- zfs-linux-0.7.12_base/module/zfs/zil.c	2019-05-20 06:27:20.000000000 -0700
++++ zfs-linux-0.7.12_v01/module/zfs/zil.c	2019-05-20 11:12:25.076458879 -0700
+@@ -42,6 +42,7 @@
+ #include <sys/metaslab.h>
+ #include <sys/trace_zil.h>
+ #include <sys/abd.h>
++#include <sys/spa_impl.h>
+ 
+ /*
+  * The zfs intent log (ZIL) saves transaction records of system calls
+@@ -455,6 +456,30 @@
+ 	return (0);
+ }
+ 
++/* ARGSUSED */
++static int
++zil_clear_log_block(zilog_t *zilog, blkptr_t *bp, void *pzh_sync_txg,
++    uint64_t txg)
++{
++	ASSERT(!BP_IS_HOLE(bp));
++
++	if (bp->blk_birth > *(uint64_t *)pzh_sync_txg)
++		return (-1);
++
++	if (zil_bp_tree_add(zilog, bp) != 0)
++		return (0);
++
++	zio_free_zil(zilog->zl_spa, txg, bp);
++	return (0);
++}
++
++/* ARGSUSED */
++static int
++zil_noop_log_record(zilog_t *zilog, lr_t *lrc, void *arg, uint64_t txg)
++{
++	return (0);
++}
++
+ static lwb_t *
+ zil_alloc_lwb(zilog_t *zilog, blkptr_t *bp, boolean_t slog, uint64_t txg,
+     boolean_t fastwrite)
+@@ -704,9 +729,11 @@
+ 	zilog = dmu_objset_zil(os);
+ 	zh = zil_header_in_syncing_context(zilog);
+ 
+-	if (spa_get_log_state(zilog->zl_spa) == SPA_LOG_CLEAR) {
++	if (spa_get_log_state(zilog->zl_spa) == SPA_LOG_CLEAR &&
++		zh->zh_claim_txg == 0) {
+ 		if (!BP_IS_HOLE(&zh->zh_log))
+-			zio_free_zil(zilog->zl_spa, first_txg, &zh->zh_log);
++			(void) zil_parse(zilog, zil_clear_log_block,
++			    zil_noop_log_record, &zh->zh_sync_txg, first_txg);
+ 		BP_ZERO(&zh->zh_log);
+ 		dsl_dataset_dirty(dmu_objset_ds(os), tx);
+ 		dmu_objset_disown(os, FTAG);
+@@ -1734,6 +1761,13 @@
+ 
+ 	ASSERT(zilog->zl_stop_sync == 0);
+ 
++	if (zh->zh_sync_txg < spa->spa_first_txg && zh->zh_claim_txg == 0) {
++		if (!BP_IS_HOLE(&zh->zh_log))
++			(void) zil_parse(zilog, zil_clear_log_block,
++			    zil_noop_log_record, &zh->zh_sync_txg, txg);
++		BP_ZERO(&zh->zh_log);
++	}
++	
+ 	if (*replayed_seq != 0) {
+ 		ASSERT(zh->zh_replay_seq < *replayed_seq);
+ 		zh->zh_replay_seq = *replayed_seq;
+@@ -1783,6 +1817,8 @@
+ 			BP_ZERO(&zh->zh_log);
+ 	}
+ 
++	zh->zh_sync_txg = txg;
++
+ 	/*
+ 	 * Remove fastwrite on any blocks that have been pre-allocated for
+ 	 * the next commit. This prevents fastwrite counter pollution by
