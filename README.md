@@ -53,7 +53,25 @@ The patch handles this case by adding a check that runs during each sync and cle
 
 ## Getting Started (wip)
 
-The patch was written against `zfs-linux` `0.7.12-1ubuntu5` (the lastest Ubuntu release when I started hacking ZFS back in 2018), which produces `zfs-dkms` when built. I have been using my custom `zfs-dkms` in production and so far my data have been intact :)
+The patch was written against `zfs-linux` `0.7.12-1ubuntu5` ~~(the lastest Ubuntu release when I started hacking ZFS back in 2018)~~. I now remember I first started with `0.6.5.6-0ubuntu18` and then finally moved on to `0.7.12-1ubuntu5` when it became available.
+
+To use this patch, you need to download the source package, install the build dependencies (listed in the accompanying `.dsc` file), apply this patch, and then build the updated source and binaries.
+
+You will find this tutorial helpful:
+https://wiki.debian.org/BuildingTutorial
+
+The build will produce the following binaries:
+```
+libnvpair1linux
+libuutil1linux
+libzfs2linux
+libzpool2linux
+zfs-dkms
+zfs-initramfs
+zfsutils-linux
+```
+
+After installation, you will need to `apt-mark hold` on each one of them. You will also need to `apt-mark hold spl-dkms`.
 
 The patch can also be applied to the stock [`zfs-0.7.12`](https://github.com/openzfs/zfs/releases/tag/zfs-0.7.12) (the result however is not tested). One simple way is to download the release, and then:
 ```
