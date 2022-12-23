@@ -1,3 +1,18 @@
+# CDDL HEADER START
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://www.opensource.org/licenses/CDDL-1.0
+#
+# CDDL HEADER END
+#
+# Copyright (C) 2018, 2019 Xiao Wan
+
 diff -Naur zfs-linux-0.7.12_base/cmd/mount_zfs/mount_zfs.c zfs-linux-0.7.12_v01/cmd/mount_zfs/mount_zfs.c
 --- zfs-linux-0.7.12_base/cmd/mount_zfs/mount_zfs.c	2018-11-08 14:40:44.000000000 -0800
 +++ zfs-linux-0.7.12_v01/cmd/mount_zfs/mount_zfs.c	2019-05-20 06:37:29.749943776 -0700
